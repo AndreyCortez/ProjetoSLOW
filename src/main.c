@@ -1,85 +1,101 @@
 #include <stdio.h>
-#include <string.h> // Para memset
+#include <string.h>
+#include <arpa/inet.h>
 #include "SLOW_peripheral.h"
 
-void print_hex(const char* label, const unsigned char* buffer, int size) {
-    printf("%s (%d bytes):\n", label, size);
-    for (int i = 0; i < size; i++) {
-        printf("%02X ", buffer[i]);
-        if ((i + 1) % 16 == 0) {
-            printf("\n");
-        }
-    }
-    printf("\n\n");
-}
-
-
-// Função para decodificar e imprimir a mensagem de dados
-void print_data_as_string(const uint8_t* data, uint16_t len) {
-    printf("Dados como String: \"");
-    for(int i = 0; i < len; i++) {
-        // Imprime apenas caracteres imprimíveis
-        if (data[i] >= 32 && data[i] <= 126) {
-            putchar(data[i]);
-        } else {
-            putchar('.'); // Usa um ponto para caracteres não imprimíveis
-        }
-    }
-    printf("\"\n\n");
-}
-
-int main() {
-    SLOW_connection_header connection;
-    const char* server_hostname = "slow.gmelodie.com";
+int main()
+{
+    SLOW_connection_t connection_state = {0}; // Inicializa a struct com zeros
+    const char *server_hostname = "slow.gmelodie.com";
     uint16_t server_port = 7033;
 
-    if (SLOW_open_socket(&connection, NULL, 0) == NULL) return 1;
-    if (SLOW_resolve_server_hostname(&connection, server_hostname, server_port) == NULL) return 1;
-    printf("Hostname resolvido para o IP: %s\n\n", connection.server_ip);
+    printf("### INICIANDO SESSÃO SLOW ###\n\n");
 
-    // --- Montando o pacote de Connect mais simples possível ---
-    SLOW_header_t connect_header;
-    memset(&connect_header, 0, sizeof(SLOW_header_t));
+    // =======================================================================
+    // FASE 1: HANDSHAKE
+    // =======================================================================
+    if (SLOW_3_way_handshake(&connection_state, server_hostname, server_port) != NULL)
+    {
+        printf("\n[MAIN] Conexão estabelecida com sucesso!\n");
 
-    // Tentativa 1: Big-Endian (Padrão de Rede)
-    connect_header.sttl_n_flags = htonl(1 << 27); // Apenas a flag Connect (bit 27)
-
-    // Deixamos window e todos os outros campos como 0.
-
-    printf("--- ENVIANDO PACOTE DE TESTE ---\n");
-    print_hex("Cabeçalho de Conexão a ser Enviado", (unsigned char*)&connect_header, sizeof(SLOW_header_t));
-    SLOW_send_packet(&connection, &connect_header, NULL, 0);
-
-    // --- AGUARDANDO E ANALISANDO A RESPOSTA EM DETALHES ---
-    SLOW_header_t response_header;
-    uint8_t response_data_buffer[1440];
-    uint16_t response_data_len;
-
-    printf("\n--- AGUARDANDO RESPOSTA ---\n");
-    if (SLOW_receive_packet(&connection, &response_header, response_data_buffer, &response_data_len)) {
-        printf("\n--- RESPOSTA DO SERVIDOR RECEBIDA ---\n");
-        
-        print_hex("Cabeçalho da Resposta Recebida", (unsigned char*)&response_header, sizeof(SLOW_header_t));
-
-        if (response_data_len > 0) {
-            print_hex("Dados da Resposta Recebidos", response_data_buffer, response_data_len);
-            print_data_as_string(response_data_buffer, response_data_len);
+        // Inicializa o estado da janela deslizante
+        connection_state.last_ack_from_server = 0;
+        connection_state.remote_window_size = 10; // Começamos com uma janela conservadora
+    }
+    else
+    {
+        printf("\n[MAIN] Falha ao estabelecer conexão com o servidor.\n");
+        if (connection_state.sockfd > 0)
+        {
+            SLOW_close_socket(&connection_state);
         }
-
-        // Analisa as flags recebidas
-        uint32_t received_flags = ntohl(response_header.sttl_n_flags);
-        int accepted = (received_flags >> 30) & 1;
-
-        if (accepted) {
-            printf("RESULTADO: Conexão ACEITA.\n");
-        } else {
-            printf("RESULTADO: Conexão REJEITADA.\n");
-        }
-    } else {
-        printf("\n--- FALHA NA REDE ---\n");
-        printf("Nenhuma resposta recebida do servidor.\n");
+        return 1;
     }
 
-    SLOW_close_socket(&connection);
+    // =======================================================================
+    // FASE 2: ENVIO DE DADOS (COM FRAGMENTAÇÃO)
+    // =======================================================================
+    printf("\n### FASE DE ENVIO DE DADOS ###\n");
+    // Cria um bloco de dados com 3000 bytes para forçar a fragmentação
+    uint8_t big_data[3000];
+    memset(big_data, 'S', sizeof(big_data)); // Preenche os dados com a letra 'S'
+
+    if (!SLOW_send_data(&connection_state, big_data, sizeof(big_data)))
+    {
+        fprintf(stderr, "[MAIN] Falha ao iniciar o envio dos dados.\n");
+    }
+    else
+    {
+        printf("[MAIN] Todos os fragmentos foram enviados para a rede.\n");
+
+        // =======================================================================
+        // FASE 3: RECEBIMENTO DOS ACKs (JANELA DESLIZANTE)
+        // =======================================================================
+        printf("\n### FASE DE RECEBIMENTO DE ACKs ###\n");
+        while (connection_state.last_ack_from_server < connection_state.our_next_seqnum - 1)
+        {
+            SLOW_header_t ack_response;
+            uint16_t data_len;
+
+            if (SLOW_receive_packet(&connection_state, &ack_response, NULL, &data_len))
+            {
+                uint32_t acked_seq = ntohl(ack_response.acknum);
+                uint16_t server_window = ntohs(ack_response.window);
+
+                printf("[ACK Recebido] Servidor confirmou até o seqnum: %u. Janela do servidor: %u\n", acked_seq, server_window);
+
+                // Atualiza o estado da nossa janela deslizante
+                if (acked_seq > connection_state.last_ack_from_server)
+                {
+                    connection_state.last_ack_from_server = acked_seq;
+                }
+                connection_state.remote_window_size = server_window;
+                connection_state.last_server_seqnum = ntohl(ack_response.seqnum);
+            }
+            else
+            {
+                printf("[MAIN] Timeout esperando por ACK. Encerrando escuta.\n");
+                break; // Sai do loop em caso de timeout
+            }
+        }
+        printf("[MAIN] Todos os pacotes enviados foram confirmados pelo servidor!\n");
+    }
+
+    // =======================================================================
+    // FASE 4: DISCONNECT
+    // =======================================================================
+    printf("\n### FASE DE DESCONEXÃO ###\n");
+    if (SLOW_disconnect(&connection_state))
+    {
+        printf("[MAIN] Pacote de disconnect enviado. Sessão encerrada.\n");
+    }
+    else
+    {
+        printf("[MAIN] Falha ao enviar o pacote de disconnect.\n");
+    }
+
+    // Fecha o socket
+    SLOW_close_socket(&connection_state);
+
     return 0;
 }
