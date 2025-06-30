@@ -39,7 +39,7 @@ servidor. Para isso, chama a função `SLOW_disconnect` que envia um pacote de
 disconnect para o servidor para encerrar a conexão.
 
 O arquivo *main.c* já fornece um exemplo de utilização do protocolo SLOW.
-Nesse caso, os dados podem ser definidos na fase dois, como está na *main.c*:
+Nesse caso, os dados podem ser definidos na fase dois, como está na linha 41 da *main.c*:
 ```
 /* preencher os dados com qualquer dado que o usuário desejar. */
 memset(big_data, 'S', sizeof(big_data)); // Preenche os dados com a letra 'S'
